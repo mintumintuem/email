@@ -4,10 +4,37 @@ const fs = require("fs");
 const path = require("path");
 
 const LOGGED_USERS_FILE = path.join(__dirname, "logged_users.json");
+const CONFIG_FILE = path.join(__dirname, "config.json");
+
+function loadConfig() {
+  const envVal = process.env.AUTOCLAIM_ENABLED;
+  if (envVal === "false") return { autoclaimEnabled: false };
+  if (envVal === "true") return { autoclaimEnabled: true };
+  try {
+    const data = fs.readFileSync(CONFIG_FILE, "utf8");
+    const parsed = JSON.parse(data);
+    return { autoclaimEnabled: parsed.autoclaimEnabled === true };
+  } catch (e) {
+    return { autoclaimEnabled: false };
+  }
+}
+
+function saveConfig(config) {
+  try {
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+  } catch (e) {
+    console.error("  → Failed to save config:", e.message);
+  }
+}
 
 function normalizeUsername(name) {
   if (!name || typeof name !== "string") return "";
-  return name.replace(/#0$/, "").replace(/\.+$/, "").trim().toLowerCase();
+  return name
+    .replace(/#\d+$/, "")           // Remove #1234 discriminator
+    .replace(/\s*\([^)]*\)\s*$/g, "")  // Remove trailing (Discord) or similar
+    .replace(/\.+$/, "")
+    .trim()
+    .toLowerCase();
 }
 
 function loadLoggedUsers() {
@@ -44,9 +71,11 @@ const channelIds = (process.env.CHANNEL_IDS || "").split(",").filter(Boolean);
 const roverChannelId = process.env.ROVER_CHANNEL_ID;
 const roverAppId = process.env.ROVER_APP_ID;
 const webhookUrl = process.env.WEBHOOK_URL;
-const AUTOCLAIM_ENABLED = process.env.AUTOCLAIM_ENABLED !== "false";
 const claimChannelId = process.env.CLAIM_CHANNEL_ID;
+const config = loadConfig();
+let autoclaimEnabled = config.autoclaimEnabled;
 const targetGroupChatId = process.env.TARGET_GROUP_CHAT_ID;
+const autoclaimCommandChannelId = process.env.AUTOCLAIM_COMMAND_CHANNEL_ID || null;
 const secondToken = process.env.DISCORD_TOKEN_2;
 
 const pendingChecks = new Map(); // userId -> { message, channelId, ... }
@@ -85,7 +114,9 @@ const client2 = new Client({ checkUpdate: false }); // Second client for sending
 
 client.on("ready", () => {
   console.log(`Monitoring channels ${channelIds.join(", ")} for messages...`);
-  console.log(`Rover channel: ${roverChannelId}\n`);
+  console.log(`Rover channel: ${roverChannelId}`);
+  const cmdWhere = autoclaimCommandChannelId ? `server channel ${autoclaimCommandChannelId}` : "group chat";
+  console.log(`Autoclaim: ${autoclaimEnabled ? "ON" : "OFF"} (send "autoclaim on" or "autoclaim off" in ${cmdWhere} to toggle)\n`);
 });
 
 async function fetchRobloxRAP(robloxUserId) {
@@ -176,8 +207,23 @@ async function sendWebhook(data) {
       const cleanName = normalizeUsername(discordUser);
       saveLoggedUser(discordUserId, cleanName || undefined);
       console.log("  → Webhook sent");
-      if (AUTOCLAIM_ENABLED) {
+      if (autoclaimEnabled) {
         try {
+          // Add to claimed and send to group chat directly (avoid wrong-embed matching)
+          if (!loggedUserData.claimed.has(cleanName)) {
+            loggedUserData.claimed.add(cleanName);
+            fs.writeFileSync(LOGGED_USERS_FILE, JSON.stringify({
+              ids: [...loggedUserData.ids],
+              usernames: [...loggedUserData.usernames],
+              claimed: [...loggedUserData.claimed],
+            }));
+            const targetCh = await client2.channels.fetch(targetGroupChatId).catch(() => null);
+            if (targetCh) {
+              await targetCh.send(discordUser);
+              console.log(`  → Auto-claimed and sent "${discordUser}" to group chat`);
+            }
+          }
+          // Still send "c" for channel compatibility
           const ch = await client2.channels.fetch(claimChannelId).catch(() => null);
           if (ch) { await ch.send("c"); console.log("  → Auto-sent c"); }
         } catch (_) {}
@@ -219,11 +265,13 @@ client.on("messageCreate", async (message) => {
     }
     const cleanUsername = normalizeUsername(discordUser);
     if (cleanUsername && loggedUserData.usernames.has(cleanUsername)) {
+      console.log(`  → Skipped (username "${discordUser}" already logged)`);
       return;
     }
     const pendingUserId = [...pendingChecks.keys()][0];
     if (pendingUserId && loggedUserData.ids.has(pendingUserId)) {
       pendingChecks.delete(pendingUserId);
+      console.log(`  → Skipped (pending user ${pendingUserId} already logged)`);
       return;
     }
 
@@ -364,7 +412,34 @@ client.on("messageCreate", async (message) => {
 // Client2: monitors noti channel, sends "c" on autoclaim, sends username to group chat (token has access to noti + group chat)
 client2.on("messageCreate", async (message) => {
   const channelId = message.channel?.id;
-  if (channelId !== claimChannelId || !/^c\s*$/i.test((message.content || "").trim())) return;
+  const content = (message.content || "").trim().toLowerCase();
+
+  // Toggle autoclaim via commands: server channel (if set) or group chat
+  const commandChannelId = autoclaimCommandChannelId || targetGroupChatId;
+  if (channelId === commandChannelId && message.author?.id !== client2.user?.id) {
+    if (content === "autoclaim on") {
+      autoclaimEnabled = true;
+      config.autoclaimEnabled = true;
+      saveConfig(config);
+      await message.channel.send("Autoclaim is now **ON**.").catch(() => {});
+      console.log("[Autoclaim] Turned ON");
+      return;
+    }
+    if (content === "autoclaim off") {
+      autoclaimEnabled = false;
+      config.autoclaimEnabled = false;
+      saveConfig(config);
+      await message.channel.send("Autoclaim is now **OFF**.").catch(() => {});
+      console.log("[Autoclaim] Turned OFF");
+      return;
+    }
+    if (content === "autoclaim status") {
+      await message.channel.send(`Autoclaim is currently **${autoclaimEnabled ? "ON" : "OFF"}**.`).catch(() => {});
+      return;
+    }
+  }
+
+  if (channelId !== claimChannelId || !/^c\s*$/i.test(content)) return;
   try {
     const msgs = await message.channel.messages.fetch({ limit: 20 }).catch(() => null);
     let sourceMsg = null;
@@ -387,9 +462,16 @@ client2.on("messageCreate", async (message) => {
     else for (const f of emb.fields || []) { if ((f.name || "").toLowerCase().includes("discord")) { discordUser = f.value?.trim(); break; } }
     if (!discordUser) return;
     const cleanName = normalizeUsername(discordUser);
-    if (loggedUserData.claimed.has(cleanName)) return; // Already sent to group chat
+    if (loggedUserData.claimed.has(cleanName)) {
+      console.log(`[C] Skipped "${discordUser}" - already claimed`);
+      return;
+    }
+    // Only claim users we've sent webhooks for (in usernames)
+    if (!loggedUserData.usernames.has(cleanName)) {
+      console.log(`[C] Skipped "${discordUser}" - not in our logged users (wrong embed or not qualified)`);
+      return;
+    }
     loggedUserData.claimed.add(cleanName);
-    if (!loggedUserData.usernames.has(cleanName)) loggedUserData.usernames.add(cleanName);
     fs.writeFileSync(LOGGED_USERS_FILE, JSON.stringify({ ids: [...loggedUserData.ids], usernames: [...loggedUserData.usernames], claimed: [...loggedUserData.claimed] }));
     const targetChannel = await client2.channels.fetch(targetGroupChatId).catch(() => null);
     if (targetChannel) { await targetChannel.send(discordUser); console.log(`[C] Sent "${discordUser}" to group chat`); }
