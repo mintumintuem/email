@@ -4,3 +4,4 @@ logged_users.json
 scan_items.json
 scan_logged.json
 .venv
+config.json
