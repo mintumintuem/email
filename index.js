@@ -99,17 +99,25 @@ const userActivity = new Map(); // userId -> timestamp[] (for activity filtering
 const recentWebhooks = new Map(); // userId -> timestamp (prevent duplicate embeds)
 
 const TEN_DAYS_MS = 10 * 24 * 60 * 60 * 1000;
+const TWO_WEEKS_MS = 14 * 24 * 60 * 60 * 1000;
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 const THIRTY_FIVE_DAYS_MS = 35 * 24 * 60 * 60 * 1000; // Keep ~1 month for novice filter
 const ONE_MINUTE_MS = 60 * 1000;
 const WEBHOOK_DEBOUNCE_MS = 90 * 1000; // Prevent duplicate webhooks for same user
 const MIN_RAP = 200000; // Minimum RAP to send webhook embed
-const NOVICE_MAX_MESSAGES_THIS_MONTH = 10; // Skip novice users with >10 messages in current month
-const BYPASS_PHRASES = ["w/l", "is this good", "dm", "help", "lf", "looking for"]; // Bypass RAP 200k min when message contains these
+const MIN_RAP_WL = 150000; // For w/l messages: send only if N/A (privated) or above 150k
+const NOVICE_MAX_TOTAL_MESSAGES = 50; // Novices must have <50 messages to qualify (unless inactive 30+ days)
+const NOVICE_MAX_MESSAGES_IF_ACTIVE_2W = 5; // If active in past 2 weeks, max 3-5 messages in that period
+const BYPASS_PHRASES = ["is this good", "dm", "help", "lf", "looking for"]; // Bypass RAP 200k min when message contains these (w/l has its own rules)
 const NOVICE_BYPASS_PHRASES = ["help", "support", "who is good at trading", "how is this item doing", "need help", "trading help", "any tips", "advice", "how do i", "what should i"]; // Bypass novice message limit - inactive users seeking trade help
 
 function messageHasBypassPhrase(content) {
   const lower = (content || "").toLowerCase();
   return BYPASS_PHRASES.some((p) => lower.includes(p));
+}
+
+function messageHasWL(content) {
+  return (content || "").toLowerCase().includes("w/l");
 }
 
 function messageHasNoviceBypassPhrase(content) {
@@ -125,13 +133,6 @@ function recordMessageActivity(userId) {
   userActivity.set(userId, userActivity.get(userId).filter((t) => t > cutoff));
 }
 
-function getMessagesInCurrentMonth(userId) {
-  const timestamps = userActivity.get(userId) || [];
-  const now = new Date();
-  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
-  return timestamps.filter((t) => t >= startOfMonth).length;
-}
-
 function isNoviceExcludingVerified(member, guild) {
   if (!member || !guild) return false;
   const verifiedRole = guild.roles?.cache?.find((r) => r.name.toLowerCase() === "rover verified");
@@ -141,6 +142,23 @@ function isNoviceExcludingVerified(member, guild) {
   const memberHighest = member.roles?.highest;
   if (!memberHighest) return true;
   return memberHighest.position <= noviceRole.position; // Novice or lower
+}
+
+/** Novice activity requirements: <50 msgs total; inactive 2+ weeks OR if active in 2w then ≤5 msgs; if ≥50 msgs then inactive 30+ days */
+function meetsNoviceActivityRequirements(userId) {
+  const timestamps = userActivity.get(userId) || [];
+  const now = Date.now();
+  const totalMessages = timestamps.length;
+  const lastMessageTime = timestamps.length ? Math.max(...timestamps) : 0;
+  const messagesInLast2Weeks = timestamps.filter((t) => now - t <= TWO_WEEKS_MS).length;
+  const inactive2Weeks = lastMessageTime === 0 || now - lastMessageTime > TWO_WEEKS_MS;
+  const inactive30Days = lastMessageTime === 0 || now - lastMessageTime > THIRTY_DAYS_MS;
+
+  if (totalMessages >= NOVICE_MAX_TOTAL_MESSAGES) {
+    return inactive30Days; // ≥50 msgs: must be inactive 30+ days
+  }
+  // <50 msgs: must be inactive 2+ weeks, OR if active in 2w then ≤5 msgs
+  return inactive2Weeks || messagesInLast2Weeks <= NOVICE_MAX_MESSAGES_IF_ACTIVE_2W;
 }
 
 function isTooActive(userId) {
@@ -368,12 +386,22 @@ client.on("messageCreate", async (message) => {
     // Fetch RAP from Roblox API
     const { rap } = await fetchRobloxRAP(robloxUserId);
 
-    // Only send webhook if RAP is at least 200k (bypass if message has w/l, is this good, dm, help)
+    // RAP check: 200k default; bypass phrases relax it; w/l has special rules (N/A or ≥150k only)
     const rapNum = rap != null ? Number(rap) : NaN;
     const hasBypassPhrase = messageHasBypassPhrase(pending.message);
-    if (!hasBypassPhrase && (Number.isNaN(rapNum) || rapNum < MIN_RAP)) {
-      console.log(`  → Skipped (RAP ${rap ?? "N/A"} < ${MIN_RAP.toLocaleString()})`);
-      return;
+    const hasWL = messageHasWL(pending.message);
+
+    if (hasWL) {
+      // w/l: only send if N/A (privated) or above 150k; not already logged is checked below
+      if (!Number.isNaN(rapNum) && rapNum < MIN_RAP_WL) {
+        console.log(`  → Skipped (w/l: RAP ${rapNum.toLocaleString()} < ${MIN_RAP_WL.toLocaleString()})`);
+        return;
+      }
+    } else if (!hasBypassPhrase) {
+      if (Number.isNaN(rapNum) || rapNum < MIN_RAP) {
+        console.log(`  → Skipped (RAP ${rap ?? "N/A"} < ${MIN_RAP.toLocaleString()})`);
+        return;
+      }
     }
 
     // Skip if user is too active (multiple msgs/min or talked multiple times in 10 days)
@@ -389,7 +417,7 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // Novice filter: skip novice users (not Verified) who have >10 messages in current month
+    // Novice filter: skip novice users who don't meet activity requirements
     // Bypass if message is about needing trade help (help, support, etc.)
     try {
       const channel = await client.channels.fetch(pending.channelId).catch(() => null);
@@ -397,9 +425,11 @@ client.on("messageCreate", async (message) => {
       const member = guild ? await guild.members.fetch(discordUserId).catch(() => null) : null;
       if (isNoviceExcludingVerified(member, guild)) {
         if (!messageHasNoviceBypassPhrase(pending.message)) {
-          const msgCount = getMessagesInCurrentMonth(discordUserId);
-          if (msgCount > NOVICE_MAX_MESSAGES_THIS_MONTH) {
-            console.log(`  → Skipped (novice with ${msgCount} messages this month, max ${NOVICE_MAX_MESSAGES_THIS_MONTH})`);
+          if (!meetsNoviceActivityRequirements(discordUserId)) {
+            const timestamps = userActivity.get(discordUserId) || [];
+            const now = Date.now();
+            const in2w = timestamps.filter((t) => now - t <= TWO_WEEKS_MS).length;
+            console.log(`  → Skipped (novice doesn't meet activity: ${timestamps.length} total msgs, ${in2w} in past 2w)`);
             return;
           }
         }
@@ -451,6 +481,19 @@ client.on("messageCreate", async (message) => {
   if (member && message.guild && !isVerifiedOrNoviceOrLower(member, message.guild)) {
     console.log(`User ID: ${userId} (skipped - role higher than Rover Verified/Novice)`);
     return;
+  }
+
+  // Novice activity filter: skip novices who don't meet activity requirements (reduces traffic)
+  if (member && message.guild && isNoviceExcludingVerified(member, message.guild)) {
+    if (!messageHasNoviceBypassPhrase(content)) {
+      if (!meetsNoviceActivityRequirements(userIdStr)) {
+        const timestamps = userActivity.get(userIdStr) || [];
+        const now = Date.now();
+        const in2w = timestamps.filter((t) => now - t <= TWO_WEEKS_MS).length;
+        console.log(`User ID: ${userId} (skipped - novice doesn't meet activity: ${timestamps.length} total msgs, ${in2w} in past 2w)`);
+        return;
+      }
+    }
   }
 
   console.log("User ID:", userId);

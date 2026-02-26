@@ -5,3 +5,5 @@ scan_items.json
 scan_logged.json
 .venv
 config.json
+emails_not_replied.txt
+emails_not_replied.csv

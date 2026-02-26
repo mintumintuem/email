@@ -12,7 +12,7 @@
 require("dotenv").config();
 const http = require("http");
 
-const PORT = process.env.EMAIL_NOTIFIER_PORT || 3847;
+const PORT = process.env.PORT || process.env.EMAIL_NOTIFIER_PORT || 3847;
 const WEBHOOK_URL = process.env.EMAIL_NOTIFIER_WEBHOOK || "https://discord.com/api/webhooks/1476525457930453086/4A81E_Uf58mpkp3TQCPBbLmiTOq7WMkD4YyneBhCGd_fQTUIgheyrRTRGi1yXm7wrN8K";
 
 function sendDiscordEmbed(data) {
