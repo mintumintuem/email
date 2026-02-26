@@ -3,8 +3,22 @@ const { Client } = require("discord.js-selfbot-v13");
 const fs = require("fs");
 const path = require("path");
 
-const LOGGED_USERS_FILE = path.join(__dirname, "logged_users.json");
-const CONFIG_FILE = path.join(__dirname, "config.json");
+// Use persistent storage on Railway (set DATA_DIR=/data and add a Volume mounted at /data)
+const DATA_DIR = process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname;
+const LOGGED_USERS_FILE = path.join(DATA_DIR, "logged_users.json");
+const CONFIG_FILE = path.join(DATA_DIR, "config.json");
+
+function ensureDataDir() {
+  if (DATA_DIR !== __dirname && !fs.existsSync(DATA_DIR)) {
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      console.log(`  → Created data dir: ${DATA_DIR}`);
+    } catch (e) {
+      console.error("  → Failed to create data dir:", e.message);
+    }
+  }
+}
+ensureDataDir(); // Run at startup so saves work
 
 function loadConfig() {
   const envVal = process.env.AUTOCLAIM_ENABLED;
@@ -82,23 +96,51 @@ const pendingChecks = new Map(); // userId -> { message, channelId, ... }
 const loggedUserData = loadLoggedUsers(); // { ids, usernames } - persisted
 const checkedUsers = new Set([...loggedUserData.ids]); // Includes persisted + session
 const userActivity = new Map(); // userId -> timestamp[] (for activity filtering)
+const recentWebhooks = new Map(); // userId -> timestamp (prevent duplicate embeds)
 
 const TEN_DAYS_MS = 10 * 24 * 60 * 60 * 1000;
+const THIRTY_FIVE_DAYS_MS = 35 * 24 * 60 * 60 * 1000; // Keep ~1 month for novice filter
 const ONE_MINUTE_MS = 60 * 1000;
+const WEBHOOK_DEBOUNCE_MS = 90 * 1000; // Prevent duplicate webhooks for same user
 const MIN_RAP = 200000; // Minimum RAP to send webhook embed
+const NOVICE_MAX_MESSAGES_THIS_MONTH = 10; // Skip novice users with >10 messages in current month
 const BYPASS_PHRASES = ["w/l", "is this good", "dm", "help", "lf", "looking for"]; // Bypass RAP 200k min when message contains these
+const NOVICE_BYPASS_PHRASES = ["help", "support", "who is good at trading", "how is this item doing", "need help", "trading help", "any tips", "advice", "how do i", "what should i"]; // Bypass novice message limit - inactive users seeking trade help
 
 function messageHasBypassPhrase(content) {
   const lower = (content || "").toLowerCase();
   return BYPASS_PHRASES.some((p) => lower.includes(p));
 }
 
+function messageHasNoviceBypassPhrase(content) {
+  const lower = (content || "").toLowerCase();
+  return NOVICE_BYPASS_PHRASES.some((p) => lower.includes(p));
+}
+
 function recordMessageActivity(userId) {
   const now = Date.now();
   if (!userActivity.has(userId)) userActivity.set(userId, []);
   userActivity.get(userId).push(now);
-  const cutoff = now - TEN_DAYS_MS;
+  const cutoff = now - THIRTY_FIVE_DAYS_MS; // Keep ~1 month for novice filter
   userActivity.set(userId, userActivity.get(userId).filter((t) => t > cutoff));
+}
+
+function getMessagesInCurrentMonth(userId) {
+  const timestamps = userActivity.get(userId) || [];
+  const now = new Date();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+  return timestamps.filter((t) => t >= startOfMonth).length;
+}
+
+function isNoviceExcludingVerified(member, guild) {
+  if (!member || !guild) return false;
+  const verifiedRole = guild.roles?.cache?.find((r) => r.name.toLowerCase() === "rover verified");
+  const noviceRole = guild.roles?.cache?.find((r) => r.name.toLowerCase() === "novice");
+  if (!noviceRole) return false;
+  if (verifiedRole && member.roles?.cache?.has(verifiedRole.id)) return false; // Has Verified, not novice
+  const memberHighest = member.roles?.highest;
+  if (!memberHighest) return true;
+  return memberHighest.position <= noviceRole.position; // Novice or lower
 }
 
 function isTooActive(userId) {
@@ -113,10 +155,12 @@ const client = new Client({ checkUpdate: false });
 const client2 = new Client({ checkUpdate: false }); // Second client for sending messages
 
 client.on("ready", () => {
+  ensureDataDir();
   console.log(`Monitoring channels ${channelIds.join(", ")} for messages...`);
   console.log(`Rover channel: ${roverChannelId}`);
-  const cmdWhere = autoclaimCommandChannelId ? `server channel ${autoclaimCommandChannelId}` : "group chat";
-  console.log(`Autoclaim: ${autoclaimEnabled ? "ON" : "OFF"} (send "autoclaim on" or "autoclaim off" in ${cmdWhere} to toggle)\n`);
+  console.log(`Data dir: ${DATA_DIR} (logged users: ${loggedUserData.ids.size})`);
+  const cmdWhere = autoclaimCommandChannelId ? `channel ${autoclaimCommandChannelId}` : "group chat";
+  console.log(`Autoclaim: ${autoclaimEnabled ? "ON" : "OFF"} (send "r" or "t" in ${cmdWhere} to toggle)\n`);
 });
 
 async function fetchRobloxRAP(robloxUserId) {
@@ -345,6 +389,33 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
+    // Novice filter: skip novice users (not Verified) who have >10 messages in current month
+    // Bypass if message is about needing trade help (help, support, etc.)
+    try {
+      const channel = await client.channels.fetch(pending.channelId).catch(() => null);
+      const guild = channel?.guild;
+      const member = guild ? await guild.members.fetch(discordUserId).catch(() => null) : null;
+      if (isNoviceExcludingVerified(member, guild)) {
+        if (!messageHasNoviceBypassPhrase(pending.message)) {
+          const msgCount = getMessagesInCurrentMonth(discordUserId);
+          if (msgCount > NOVICE_MAX_MESSAGES_THIS_MONTH) {
+            console.log(`  → Skipped (novice with ${msgCount} messages this month, max ${NOVICE_MAX_MESSAGES_THIS_MONTH})`);
+            return;
+          }
+        }
+      }
+    } catch (e) {
+      console.error("  → Novice check error:", e.message);
+    }
+
+    // Debounce: prevent duplicate webhooks for same user (set before async sendWebhook)
+    const now = Date.now();
+    if (recentWebhooks.has(discordIdStr) && now - recentWebhooks.get(discordIdStr) < WEBHOOK_DEBOUNCE_MS) {
+      console.log(`  → Skipped (duplicate, sent for ${discordUser} recently)`);
+      return;
+    }
+    recentWebhooks.set(discordIdStr, now);
+
     // Send webhook (use rapNum when valid, else null for display)
     await sendWebhook({
       robloxUserId,
@@ -396,6 +467,7 @@ client.on("messageCreate", async (message) => {
     messageId: message.id,
     discordUsername: authorUsername,
     displayName: displayName,
+    guildId: message.guild?.id,
   });
 
   try {
@@ -414,10 +486,10 @@ client2.on("messageCreate", async (message) => {
   const channelId = message.channel?.id;
   const content = (message.content || "").trim().toLowerCase();
 
-  // Toggle autoclaim via commands: server channel (if set) or group chat
+  // Toggle autoclaim via commands: r = on, t = off (in command channel)
   const commandChannelId = autoclaimCommandChannelId || targetGroupChatId;
   if (channelId === commandChannelId && message.author?.id !== client2.user?.id) {
-    if (content === "autoclaim on") {
+    if (content === "r") {
       autoclaimEnabled = true;
       config.autoclaimEnabled = true;
       saveConfig(config);
@@ -425,16 +497,12 @@ client2.on("messageCreate", async (message) => {
       console.log("[Autoclaim] Turned ON");
       return;
     }
-    if (content === "autoclaim off") {
+    if (content === "t") {
       autoclaimEnabled = false;
       config.autoclaimEnabled = false;
       saveConfig(config);
       await message.channel.send("Autoclaim is now **OFF**.").catch(() => {});
       console.log("[Autoclaim] Turned OFF");
-      return;
-    }
-    if (content === "autoclaim status") {
-      await message.channel.send(`Autoclaim is currently **${autoclaimEnabled ? "ON" : "OFF"}**.`).catch(() => {});
       return;
     }
   }

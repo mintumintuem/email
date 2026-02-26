@@ -1,16 +1,1 @@
-{
-  "name": "botop",
-  "version": "1.0.0",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js",
-    "scan": "node scan.js",
-    "start:all": "concurrently -n index,scan \"node index.js\" \"node scan.js\""
-  },
-  "dependencies": {
-    "concurrently": "^9.1.0",
-    "debug": "^4.4.3",
-    "discord.js-selfbot-v13": "^3.7.0",
-    "dotenv": "^17.3.1"
-  }
-}
+{"name":"botop","version":"1.0.0","main":"index.js","scripts":{"start":"node index.js","scan":"node scan.js","start:all":"concurrently -n index,scan \"node index.js\" \"node scan.js\"","email:filter":"node email-filter.js","email:notifier":"node email-notifier.js"},"dependencies":{"concurrently":"^9.1.0","debug":"^4.4.3","discord.js-selfbot-v13":"^3.7.0","dotenv":"^17.3.1"}}
