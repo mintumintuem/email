@@ -6,7 +6,6 @@ const path = require("path");
 // Use persistent storage on Railway (set DATA_DIR=/data and add a Volume mounted at /data)
 const DATA_DIR = process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname;
 const LOGGED_USERS_FILE = path.join(DATA_DIR, "logged_users.json");
-const CONFIG_FILE = path.join(DATA_DIR, "config.json");
 
 function ensureDataDir() {
   if (DATA_DIR !== __dirname && !fs.existsSync(DATA_DIR)) {
@@ -19,27 +18,6 @@ function ensureDataDir() {
   }
 }
 ensureDataDir(); // Run at startup so saves work
-
-function loadConfig() {
-  const envVal = process.env.AUTOCLAIM_ENABLED;
-  if (envVal === "false") return { autoclaimEnabled: false };
-  if (envVal === "true") return { autoclaimEnabled: true };
-  try {
-    const data = fs.readFileSync(CONFIG_FILE, "utf8");
-    const parsed = JSON.parse(data);
-    return { autoclaimEnabled: parsed.autoclaimEnabled === true };
-  } catch (e) {
-    return { autoclaimEnabled: false };
-  }
-}
-
-function saveConfig(config) {
-  try {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
-  } catch (e) {
-    console.error("  → Failed to save config:", e.message);
-  }
-}
 
 function normalizeUsername(name) {
   if (!name || typeof name !== "string") return "";
@@ -67,7 +45,9 @@ function loadLoggedUsers() {
 
 function saveLoggedUser(userId, username) {
   try {
-    loggedUserData.ids.add(userId);
+    const userIdStr = String(userId);
+    loggedUserData.ids.add(userIdStr);
+    checkedUsers.add(userIdStr); // Only mark checked after successful webhook/log
     const normalized = username ? normalizeUsername(username) : "";
     if (normalized) loggedUserData.usernames.add(normalized);
     fs.writeFileSync(LOGGED_USERS_FILE, JSON.stringify({
@@ -80,17 +60,56 @@ function saveLoggedUser(userId, username) {
   }
 }
 
-const token = process.env.DISCORD_TOKEN;
-const channelIds = (process.env.CHANNEL_IDS || "").split(",").filter(Boolean);
-const roverChannelId = process.env.ROVER_CHANNEL_ID;
-const roverAppId = process.env.ROVER_APP_ID;
-const webhookUrl = process.env.WEBHOOK_URL;
-const claimChannelId = process.env.CLAIM_CHANNEL_ID;
-const config = loadConfig();
-let autoclaimEnabled = config.autoclaimEnabled;
-const targetGroupChatId = process.env.TARGET_GROUP_CHAT_ID;
-const autoclaimCommandChannelId = process.env.AUTOCLAIM_COMMAND_CHANNEL_ID || null;
-const secondToken = process.env.DISCORD_TOKEN_2;
+function parseIdList(value) {
+  return String(value || "")
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+function parseId(value) {
+  const v = String(value || "").trim();
+  return v || null;
+}
+
+function getEnv(name, fallback = "") {
+  const value = process.env[name];
+  if (value == null) return fallback;
+  return String(value).trim();
+}
+
+const BLOXLINK_APPLICATION_ID = "426537812993638400";
+
+const token = getEnv("DISCORD_TOKEN");
+const channelIds = parseIdList(getEnv("CHANNEL_IDS"));
+const roverChannelId = parseId(getEnv("ROVER_CHANNEL_ID"));
+/** rover | bloxlink — Rolimons-style servers often use Bloxlink now */
+const verifyBot = getEnv("VERIFY_BOT", "bloxlink").toLowerCase();
+const verifyAppId =
+  verifyBot === "bloxlink"
+    ? parseId(getEnv("ROVER_APP_ID")) || BLOXLINK_APPLICATION_ID
+    : parseId(getEnv("ROVER_APP_ID"));
+/** First argument to sendSlash after app id, e.g. `getinfo` or `whois discord` */
+const verifySlashCommand =
+  getEnv("VERIFY_SLASH_COMMAND") ||
+  (verifyBot === "bloxlink" ? "getinfo" : "whois discord");
+const webhookUrl = getEnv("WEBHOOK_URL");
+const claimChannelId = parseId(getEnv("CLAIM_CHANNEL_ID"));
+const targetGroupChatId = parseId(getEnv("TARGET_GROUP_CHAT_ID"));
+const secondToken = getEnv("DISCORD_TOKEN_2");
+
+const VERIFY_SLASH_MAX_RETRIES = Math.min(
+  12,
+  Math.max(1, parseInt(String(getEnv("VERIFY_SLASH_MAX_RETRIES", "5")), 10) || 5)
+);
+const VERIFY_SLASH_BASE_DELAY_MS = Math.min(
+  60000,
+  Math.max(250, parseInt(String(getEnv("VERIFY_SLASH_BASE_DELAY_MS", "2000")), 10) || 2000)
+);
+const VERIFY_SLASH_MIN_INTERVAL_MS = Math.min(
+  10000,
+  Math.max(0, parseInt(String(getEnv("VERIFY_SLASH_MIN_INTERVAL_MS", "600")), 10) || 600)
+);
 
 const pendingChecks = new Map(); // userId -> { message, channelId, ... }
 const loggedUserData = loadLoggedUsers(); // { ids, usernames } - persisted
@@ -133,12 +152,29 @@ function recordMessageActivity(userId) {
   userActivity.set(userId, userActivity.get(userId).filter((t) => t > cutoff));
 }
 
+// Roles that always qualify (even above Novice) and skip novice activity rules — match server role names (case-insensitive)
+const ELEVATED_TRACKED_ROLE_NAMES = [
+  "rover verified",
+  "verified",
+  "blox-link verified",
+  "bloxlink verified",
+  "nitro booster",
+];
+
+function memberHasElevatedTrackedRole(member, guild) {
+  if (!member || !guild) return false;
+  for (const name of ELEVATED_TRACKED_ROLE_NAMES) {
+    const r = guild.roles?.cache?.find((role) => role.name.toLowerCase() === name);
+    if (r && member.roles?.cache?.has(r.id)) return true;
+  }
+  return false;
+}
+
 function isNoviceExcludingVerified(member, guild) {
   if (!member || !guild) return false;
-  const verifiedRole = guild.roles?.cache?.find((r) => r.name.toLowerCase() === "rover verified");
   const noviceRole = guild.roles?.cache?.find((r) => r.name.toLowerCase() === "novice");
   if (!noviceRole) return false;
-  if (verifiedRole && member.roles?.cache?.has(verifiedRole.id)) return false; // Has Verified, not novice
+  if (memberHasElevatedTrackedRole(member, guild)) return false; // Not treated as novice
   const memberHighest = member.roles?.highest;
   if (!memberHighest) return true;
   return memberHighest.position <= noviceRole.position; // Novice or lower
@@ -165,20 +201,189 @@ function isTooActive(userId) {
   const timestamps = userActivity.get(userId) || [];
   const now = Date.now();
   const inLastMinute = timestamps.filter((t) => now - t < ONE_MINUTE_MS).length;
-  const inLast10Days = timestamps.length;
+  const inLast10Days = timestamps.filter((t) => now - t <= TEN_DAYS_MS).length;
   return inLastMinute >= 2 || inLast10Days >= 2;
+}
+
+let lastVerificationSlashAt = 0;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function restStatusFromError(err) {
+  if (!err) return null;
+  const s = err.status ?? err.statusCode ?? err.httpStatus;
+  if (typeof s === "number" && s > 0) return s;
+  const msg = String(err.message || err);
+  if (/503|service unavailable/i.test(msg)) return 503;
+  if (/502|bad gateway/i.test(msg)) return 502;
+  if (/504|gateway time-?out/i.test(msg)) return 504;
+  if (/429|rate ?limit/i.test(msg)) return 429;
+  return null;
+}
+
+function isRetryableDiscordInteractionError(err) {
+  const s = restStatusFromError(err);
+  if (s === 502 || s === 503 || s === 504 || s === 429) return true;
+  const code = err && err.code;
+  if (code === "ECONNRESET" || code === "ETIMEDOUT" || code === "ENOTFOUND") return true;
+  return false;
+}
+
+async function maybeThrottleVerificationSlash() {
+  if (VERIFY_SLASH_MIN_INTERVAL_MS <= 0) return;
+  const now = Date.now();
+  const wait = lastVerificationSlashAt + VERIFY_SLASH_MIN_INTERVAL_MS - now;
+  if (wait > 0) await sleep(wait);
+  lastVerificationSlashAt = Date.now();
+}
+
+/** Discord /interactions sometimes returns 503/502/504; selfbots also hit rate limits (429). */
+async function sendVerificationSlash(verifyChannel, appId, command, userId) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= VERIFY_SLASH_MAX_RETRIES; attempt++) {
+    await maybeThrottleVerificationSlash();
+    try {
+      await verifyChannel.sendSlash(appId, command, userId);
+      if (attempt > 1) console.log(`  → Slash succeeded on attempt ${attempt}`);
+      return;
+    } catch (e) {
+      lastErr = e;
+      const s = restStatusFromError(e);
+      const retryable = isRetryableDiscordInteractionError(e);
+      if (!retryable || attempt >= VERIFY_SLASH_MAX_RETRIES) {
+        throw e;
+      }
+      let delay = VERIFY_SLASH_BASE_DELAY_MS * 2 ** (attempt - 1);
+      if (s === 429) {
+        const ra = e?.rawError?.retry_after ?? e?.retry_after;
+        if (typeof ra === "number" && ra > 0) {
+          delay = Math.max(delay, ra * 1000);
+        }
+      }
+      delay = Math.min(delay, 60000);
+      console.warn(
+        `  → Slash transient (${s ?? "network"}), retry ${attempt}/${VERIFY_SLASH_MAX_RETRIES} in ${delay}ms: ${e.message}`
+      );
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
+
+function collectEmbedText(embed) {
+  const parts = [
+    embed.title,
+    embed.description,
+    embed.footer?.text,
+    ...(embed.fields || []).flatMap((f) => [f.name, f.value]),
+  ];
+  return parts.filter(Boolean).join("\n");
+}
+
+function stripInlineMarkdown(value) {
+  return String(value || "")
+    .replace(/<@[!&]?\d+>/g, "")
+    .replace(/[*_`]/g, "")
+    .trim();
+}
+
+/** RoVer + Bloxlink embeds: fields, roblox.com/users/ID, numeric Roblox id fields */
+function parseRobloxUserIdFromVerificationEmbed(embed) {
+  for (const field of embed.fields || []) {
+    const name = (field.name || "").toLowerCase();
+    const raw = stripInlineMarkdown(String(field.value || "").trim());
+    if (!raw) continue;
+    const digits = raw.replace(/\D/g, "");
+    if (
+      digits &&
+      (name.includes("roblox") || name.includes("rblx")) &&
+      (name.includes("user id") || name.includes("userid") || /\bid\b/.test(name) || name.includes("account"))
+    ) {
+      return digits;
+    }
+    if ((name === "roblox id" || name === "user id") && digits.length >= 5) {
+      return digits;
+    }
+  }
+  const blob = collectEmbedText(embed);
+  const urlMatch = blob.match(/roblox\.com\/users\/(\d+)/i);
+  if (urlMatch) return urlMatch[1];
+  return null;
+}
+
+function parseDiscordUserFromVerificationEmbed(embed) {
+  let discordUser = embed.title || null;
+  if (!discordUser && embed.description) {
+    const m = embed.description.match(/\*\*([^*]+)\*\*/);
+    if (m) discordUser = m[1];
+  }
+  if (!discordUser && embed.description) {
+    const notVerifiedMatch = embed.description.match(/^([^\-]+)\s*[-–]\s*[Tt]his user is not verified/i);
+    if (notVerifiedMatch) discordUser = notVerifiedMatch[1].trim();
+  }
+  if (!discordUser && embed.description) {
+    const boldNotVerified = embed.description.match(/\*\*([^*]+)\*\*\s*[—–-]\s*[Tt]his user is not verified/i);
+    if (boldNotVerified) discordUser = boldNotVerified[1].trim();
+  }
+  if (!discordUser && embed.fields) {
+    for (const f of embed.fields) {
+      const n = (f.name || "").toLowerCase();
+      if (n.includes("discord") && !n.includes("id")) {
+        discordUser = stripInlineMarkdown(f.value);
+        break;
+      }
+    }
+  }
+  return discordUser;
+}
+
+function isUnlinkedVerificationEmbed(embed) {
+  const desc = (embed.description || "").toLowerCase();
+  const title = (embed.title || "").toLowerCase();
+  const blob = collectEmbedText(embed).toLowerCase();
+  const phrases = [
+    "not verified",
+    "isn't verified",
+    "is not verified",
+    "not linked",
+    "isn't linked",
+    "is not linked",
+    "no account linked",
+    "no roblox account",
+    "does not have a roblox",
+    "doesn't have a roblox",
+    "not linked to roblox",
+    "unable to find",
+    "couldn't find",
+    "could not find",
+  ];
+  return phrases.some((p) => desc.includes(p) || title.includes(p) || blob.includes(p));
 }
 
 const client = new Client({ checkUpdate: false });
 const client2 = new Client({ checkUpdate: false }); // Second client for sending messages
+let isShuttingDown = false;
 
 client.on("ready", () => {
   ensureDataDir();
   console.log(`Monitoring channels ${channelIds.join(", ")} for messages...`);
-  console.log(`Rover channel: ${roverChannelId}`);
+  console.log(`Verification bot: ${verifyBot} (slash: /${verifySlashCommand.replace(/\s+/g, " ")})`);
+  console.log(`Verification channel: ${roverChannelId}`);
+  if (!channelIds.length) {
+    console.warn("  → CHANNEL_IDS is empty after parsing. Check your .env formatting.");
+  }
+  if (!token || !secondToken || !roverChannelId || !verifyAppId || !webhookUrl) {
+    console.warn("  → One or more required env vars are missing/blank after parsing.");
+    console.warn(
+      `  → token:${!!token} token2:${!!secondToken} verifyChannel:${!!roverChannelId} verifyApp:${!!verifyAppId} webhook:${!!webhookUrl}`
+    );
+  }
+  console.log(
+    `Filters active: activity(1m>=2 or 10d>=2), novice(${NOVICE_MAX_TOTAL_MESSAGES} total, ${NOVICE_MAX_MESSAGES_IF_ACTIVE_2W} in 2w if active)`
+  );
   console.log(`Data dir: ${DATA_DIR} (logged users: ${loggedUserData.ids.size})`);
-  const cmdWhere = autoclaimCommandChannelId ? `channel ${autoclaimCommandChannelId}` : "group chat";
-  console.log(`Autoclaim: ${autoclaimEnabled ? "ON" : "OFF"} (send "r" or "t" in ${cmdWhere} to toggle)\n`);
 });
 
 async function fetchRobloxRAP(robloxUserId) {
@@ -243,17 +448,47 @@ async function fetchRobloxRAP(robloxUserId) {
   }
 }
 
+async function fetchRobloxHeadshotUrl(robloxUserId) {
+  try {
+    const url =
+      `https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${encodeURIComponent(robloxUserId)}` +
+      "&size=150x150&format=Png&isCircular=false";
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const json = await res.json();
+    return json?.data?.[0]?.imageUrl || null;
+  } catch {
+    return null;
+  }
+}
+
+function buildDiscordMessageJumpUrl(guildId, channelId, messageId) {
+  if (guildId) {
+    return `https://discord.com/channels/${guildId}/${channelId}/${messageId}`;
+  }
+  return `https://discord.com/channels/@me/${channelId}/${messageId}`;
+}
+
+/** Escape * and _ so user text can sit inside italics without breaking Discord markdown */
+function escapeForDiscordItalics(text) {
+  return String(text)
+    .replace(/\\/g, "\\\\")
+    .replace(/\*/g, "\\*")
+    .replace(/_/g, "\\_");
+}
+
 async function sendWebhook(data) {
   const { robloxUserId, discordUser, discordUserId, rap, message, channelId, messageId, avatarUrl } = data;
-  const roliUrl = `https://www.rolimons.com/player/${robloxUserId}`;
   const jumpUrl = `https://discord.com/channels/@me/${channelId}/${messageId}`;
 
-  // Clean up Discord username by removing #0
-  const cleanDiscordUser = discordUser ? discordUser.replace(/#0$/, '') : "Unknown";
+  const cleanDiscordUser = discordUser ? discordUser.replace(/#0$/, "") : "Unknown";
   const rapDisplay = rap != null ? rap.toLocaleString() : "N/A";
+  const roliPart = robloxUserId
+    ? ` • [Rolimons](https://www.rolimons.com/player/${robloxUserId})`
+    : " • No Roblox link (verification bot)";
 
   const embed = {
-    description: `**${cleanDiscordUser}** • RAP: **${rapDisplay}**\n${message || "(no message)"}\n\n[Jump to Message](${jumpUrl}) • [Rolimons](${roliUrl})`,
+    description: `**${cleanDiscordUser}** • RAP: **${rapDisplay}**\n${message || "(no message)"}\n\n[Jump to Message](${jumpUrl})${roliPart}`,
     color: 0x00ff00,
     thumbnail: { url: avatarUrl || "https://via.placeholder.com/150" },
     timestamp: new Date().toISOString(),
@@ -269,27 +504,6 @@ async function sendWebhook(data) {
       const cleanName = normalizeUsername(discordUser);
       saveLoggedUser(discordUserId, cleanName || undefined);
       console.log("  → Webhook sent");
-      if (autoclaimEnabled) {
-        try {
-          // Add to claimed and send to group chat directly (avoid wrong-embed matching)
-          if (!loggedUserData.claimed.has(cleanName)) {
-            loggedUserData.claimed.add(cleanName);
-            fs.writeFileSync(LOGGED_USERS_FILE, JSON.stringify({
-              ids: [...loggedUserData.ids],
-              usernames: [...loggedUserData.usernames],
-              claimed: [...loggedUserData.claimed],
-            }));
-            const targetCh = await client2.channels.fetch(targetGroupChatId).catch(() => null);
-            if (targetCh) {
-              await targetCh.send(discordUser);
-              console.log(`  → Auto-claimed and sent "${discordUser}" to group chat`);
-            }
-          }
-          // Still send "c" for channel compatibility
-          const ch = await client2.channels.fetch(claimChannelId).catch(() => null);
-          if (ch) { await ch.send("c"); console.log("  → Auto-sent c"); }
-        } catch (_) {}
-      }
     } else {
       console.error("  → Webhook failed:", res.status);
     }
@@ -299,32 +513,24 @@ async function sendWebhook(data) {
 }
 
 function isVerifiedOrNoviceOrLower(member, guild) {
-  const noviceRole = guild?.roles?.cache?.find((r) => r.name.toLowerCase() === "novice");
-  const verifiedRole = guild?.roles?.cache?.find((r) => r.name.toLowerCase() === "rover verified");
-  const cutoffRole = [noviceRole, verifiedRole].filter(Boolean).sort((a, b) => b.position - a.position)[0];
-  if (!cutoffRole) return true;
-  const memberHighest = member?.roles?.highest;
+  if (!member || !guild) return true;
+  // Elevated roles always qualify — often stacked with Member, Trader, etc.
+  if (memberHasElevatedTrackedRole(member, guild)) return true;
+  const noviceRole = guild.roles?.cache?.find((r) => r.name.toLowerCase() === "novice");
+  if (!noviceRole) return true;
+  const memberHighest = member.roles?.highest;
   if (!memberHighest) return true;
-  return memberHighest.position <= cutoffRole.position;
+  return memberHighest.position <= noviceRole.position; // Novice or lower (no elevated role)
 }
 
 client.on("messageCreate", async (message) => {
   const channelId = message.channel?.id;
   const authorId = message.author?.id;
 
-  // Handle Rover's embed response
-  if (channelId === roverChannelId && authorId === roverAppId && message.embeds?.length) {
+  // Handle RoVer / Bloxlink embed response (same channel + verification bot application id)
+  if (channelId === roverChannelId && authorId === verifyAppId && message.embeds?.length) {
     const embed = message.embeds[0];
-    let discordUser = embed.title || null;
-    if (!discordUser && embed.description) {
-      const m = embed.description.match(/\*\*([^*]+)\*\*/);
-      if (m) discordUser = m[1];
-    }
-    if (!discordUser && embed.fields) {
-      for (const f of embed.fields) {
-        if (f.name?.toLowerCase().includes("discord")) { discordUser = f.value; break; }
-      }
-    }
+    const discordUser = parseDiscordUserFromVerificationEmbed(embed);
     const cleanUsername = normalizeUsername(discordUser);
     if (cleanUsername && loggedUserData.usernames.has(cleanUsername)) {
       console.log(`  → Skipped (username "${discordUser}" already logged)`);
@@ -337,21 +543,16 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    let robloxUserId = null;
-    for (const field of embed.fields || []) {
-      const name = (field.name || "").toLowerCase();
-      const value = (field.value || "").trim();
-      if (name.includes("roblox") && (name.includes("user id") || name.includes("id"))) {
-        robloxUserId = value;
-        break;
-      }
-    }
-    if (!robloxUserId) {
-      console.log("  → No Roblox User ID found in embed, skipping");
-      return;
-    }
+    const robloxUserId = parseRobloxUserIdFromVerificationEmbed(embed);
 
-    // Match this embed to the correct pending check by Discord username (Rover can respond out of order)
+    // Diagnostic: show exactly what the verification bot returned so we can confirm parsing
+    console.log(
+      `  → [verify embed] parsedDiscord="${discordUser || ""}" parsedRobloxId=${robloxUserId || "none"} | ` +
+        `title="${embed.title || ""}" desc="${(embed.description || "").slice(0, 160)}" ` +
+        `fields=[${(embed.fields || []).map((f) => `${f.name}=${String(f.value || "").slice(0, 40)}`).join(" | ")}]`
+    );
+
+    // Match this embed to the correct pending check by Discord username (bot can respond out of order)
     let discordUserId = null;
     let pending = null;
     for (const [userId, data] of pendingChecks.entries()) {
@@ -376,44 +577,66 @@ client.on("messageCreate", async (message) => {
       console.log("  → No pending check found for this embed");
       return;
     }
+
+    // Skip if already logged (check ID early to avoid redundant work)
+    const discordIdStr = String(discordUserId);
+    if (loggedUserData.ids.has(discordIdStr)) {
+      pendingChecks.delete(discordUserId);
+      console.log(`  → Skipped (already logged: ${discordUser || discordUserId})`);
+      return;
+    }
     pendingChecks.delete(discordUserId);
 
     // Try to get avatar from embed thumbnail or image
     const avatarUrl = embed.thumbnail?.url || embed.image?.url;
 
-    console.log(`  → Roblox ID: ${robloxUserId}, Discord: ${discordUser || discordUserId}`);
+    const isNotLinked = isUnlinkedVerificationEmbed(embed);
 
-    // Fetch RAP from Roblox API
-    const { rap } = await fetchRobloxRAP(robloxUserId);
+    /** Embed has no Roblox user id — still log Discord user when clearly unlinked / we have a display name */
+    function shouldLogWithoutRobloxId() {
+      if (robloxUserId || !cleanUsername) return false;
+      const t = (discordUser || "").trim().toLowerCase();
+      if (["error", "oops", "failed", "invalid", "warning"].includes(t)) return false;
+      return isNotLinked || !!discordUser;
+    }
 
-    // RAP check: 200k default; bypass phrases relax it; w/l has special rules (N/A or ≥150k only)
-    const rapNum = rap != null ? Number(rap) : NaN;
-    const hasBypassPhrase = messageHasBypassPhrase(pending.message);
-    const hasWL = messageHasWL(pending.message);
+    let rapNum = null;
+    let finalRobloxUserId = robloxUserId;
 
-    if (hasWL) {
-      // w/l: only send if N/A (privated) or above 150k; not already logged is checked below
-      if (!Number.isNaN(rapNum) && rapNum < MIN_RAP_WL) {
-        console.log(`  → Skipped (w/l: RAP ${rapNum.toLocaleString()} < ${MIN_RAP_WL.toLocaleString()})`);
-        return;
+    if (robloxUserId) {
+      console.log(`  → Roblox ID: ${robloxUserId}, Discord: ${discordUser || discordUserId}`);
+      const { rap } = await fetchRobloxRAP(robloxUserId);
+      rapNum = rap != null ? Number(rap) : NaN;
+
+      const hasBypassPhrase = messageHasBypassPhrase(pending.message);
+      const hasWL = messageHasWL(pending.message);
+
+      if (hasWL) {
+        if (!Number.isNaN(rapNum) && rapNum < MIN_RAP_WL) {
+          console.log(`  → Skipped (w/l: RAP ${rapNum.toLocaleString()} < ${MIN_RAP_WL.toLocaleString()})`);
+          return;
+        }
+      } else if (!hasBypassPhrase) {
+        if (Number.isNaN(rapNum) || rapNum < MIN_RAP) {
+          console.log(`  → Skipped (RAP ${rap ?? "N/A"} < ${MIN_RAP.toLocaleString()})`);
+          return;
+        }
       }
-    } else if (!hasBypassPhrase) {
-      if (Number.isNaN(rapNum) || rapNum < MIN_RAP) {
-        console.log(`  → Skipped (RAP ${rap ?? "N/A"} < ${MIN_RAP.toLocaleString()})`);
-        return;
-      }
+      rapNum = Number.isNaN(rapNum) ? null : rapNum;
+    } else if (shouldLogWithoutRobloxId()) {
+      console.log(
+        `  → ${verifyBot}: no Roblox link for ${discordUser || discordUserId} (${isNotLinked ? "unlinked / not verified" : "no ID in embed"}), logging anyway (RAP: N/A)`
+      );
+      finalRobloxUserId = null;
+      rapNum = null;
+    } else {
+      console.log("  → No Roblox User ID found in embed, skipping");
+      return;
     }
 
     // Skip if user is too active (multiple msgs/min or talked multiple times in 10 days)
     if (isTooActive(discordUserId)) {
       console.log(`  → Skipped (too active in Rolimons)`);
-      return;
-    }
-
-    // Skip if we've already logged this user before (persists across restarts)
-    const discordIdStr = String(discordUserId);
-    if (loggedUserData.ids.has(discordIdStr)) {
-      console.log(`  → Skipped (already logged before)`);
       return;
     }
 
@@ -446,15 +669,16 @@ client.on("messageCreate", async (message) => {
     }
     recentWebhooks.set(discordIdStr, now);
 
-    // Send webhook (use rapNum when valid, else null for display)
+    // Send webhook
     await sendWebhook({
-      robloxUserId,
+      robloxUserId: finalRobloxUserId,
       discordUser,
       discordUserId: discordIdStr,
-      rap: Number.isNaN(rapNum) ? null : rapNum,
+      rap: rapNum,
       message: pending.message,
       channelId: pending.channelId,
       messageId: pending.messageId,
+      guildId: pending.guildId,
       avatarUrl,
     });
     return;
@@ -479,28 +703,23 @@ client.on("messageCreate", async (message) => {
 
   const member = message.member ?? (await message.guild?.members?.fetch(userId).catch(() => null));
   if (member && message.guild && !isVerifiedOrNoviceOrLower(member, message.guild)) {
-    console.log(`User ID: ${userId} (skipped - role higher than Rover Verified/Novice)`);
+    console.log(`User ID: ${userId} (skipped - not Novice-or-below and missing elevated role)`);
     return;
   }
 
-  // Novice activity filter: skip novices who don't meet activity requirements (reduces traffic)
+  // Novice activity filter: skip novices who don't meet activity requirements (no bypass)
   if (member && message.guild && isNoviceExcludingVerified(member, message.guild)) {
-    if (!messageHasNoviceBypassPhrase(content)) {
-      if (!meetsNoviceActivityRequirements(userIdStr)) {
-        const timestamps = userActivity.get(userIdStr) || [];
-        const now = Date.now();
-        const in2w = timestamps.filter((t) => now - t <= TWO_WEEKS_MS).length;
-        console.log(`User ID: ${userId} (skipped - novice doesn't meet activity: ${timestamps.length} total msgs, ${in2w} in past 2w)`);
-        return;
-      }
+    if (!meetsNoviceActivityRequirements(userIdStr)) {
+      const timestamps = userActivity.get(userIdStr) || [];
+      const now = Date.now();
+      const in2w = timestamps.filter((t) => now - t <= TWO_WEEKS_MS).length;
+      console.log(`User ID: ${userId} (skipped - novice doesn't meet activity: ${timestamps.length} total msgs, ${in2w} in past 2w)`);
+      return;
     }
   }
 
   console.log("User ID:", userId);
   
-  // Mark user as checked
-  checkedUsers.add(userIdStr);
-
   // Store message info for later embed parsing (include username to match Rover's embed)
   const authorUsername = message.author?.username || message.author?.globalName || "";
   const displayName = message.member?.displayName || message.author?.globalName || authorUsername;
@@ -514,41 +733,20 @@ client.on("messageCreate", async (message) => {
   });
 
   try {
-    const roverChannel = await client.channels.fetch(roverChannelId);
-    await roverChannel.sendSlash(roverAppId, "whois discord", userId);
-    console.log(`  → Sent /whois to Rover`);
+    const verifyChannel = await client.channels.fetch(roverChannelId);
+    await sendVerificationSlash(verifyChannel, verifyAppId, verifySlashCommand, userId);
+    console.log(`  → Sent /${verifySlashCommand.replace(/\s+/g, " ")} (${verifyBot})`);
   } catch (e) {
-    console.error("  → Slash failed:", e.message);
+    console.error("  → Verification lookup failed:", e.message);
     pendingChecks.delete(userIdStr);
   }
 });
 
 
-// Client2: monitors noti channel, sends "c" on autoclaim, sends username to group chat (token has access to noti + group chat)
+// Client2: monitors claim channel, sends username to group chat when "c" is sent (manual claim)
 client2.on("messageCreate", async (message) => {
   const channelId = message.channel?.id;
   const content = (message.content || "").trim().toLowerCase();
-
-  // Toggle autoclaim via commands: r = on, t = off (in command channel)
-  const commandChannelId = autoclaimCommandChannelId || targetGroupChatId;
-  if (channelId === commandChannelId && message.author?.id !== client2.user?.id) {
-    if (content === "r") {
-      autoclaimEnabled = true;
-      config.autoclaimEnabled = true;
-      saveConfig(config);
-      await message.channel.send("Autoclaim is now **ON**.").catch(() => {});
-      console.log("[Autoclaim] Turned ON");
-      return;
-    }
-    if (content === "t") {
-      autoclaimEnabled = false;
-      config.autoclaimEnabled = false;
-      saveConfig(config);
-      await message.channel.send("Autoclaim is now **OFF**.").catch(() => {});
-      console.log("[Autoclaim] Turned OFF");
-      return;
-    }
-  }
 
   if (channelId !== claimChannelId || !/^c\s*$/i.test(content)) return;
   try {
@@ -598,4 +796,31 @@ client.login(token).catch((e) => {
 client2.login(secondToken).catch((e) => {
   console.error("Client 2 login failed:", e.message);
   process.exit(1);
+});
+
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`\nReceived ${signal}. Shutting down gracefully...`);
+
+  try {
+    await Promise.allSettled([
+      client.destroy(),
+      client2.destroy(),
+    ]);
+    console.log("Discord clients disconnected.");
+  } catch (e) {
+    console.error("Error during shutdown:", e.message);
+  } finally {
+    // Exit 0 for platform-driven termination (e.g., redeploy/stop)
+    process.exit(0);
+  }
+}
+
+process.on("SIGTERM", () => {
+  gracefulShutdown("SIGTERM");
+});
+
+process.on("SIGINT", () => {
+  gracefulShutdown("SIGINT");
 });
